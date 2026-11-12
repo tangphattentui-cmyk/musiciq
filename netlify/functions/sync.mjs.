@@ -1,0 +1,101 @@
+import { getStore } from "@netlify/blobs";
+import { createHash, createHmac, createPublicKey, verify, timingSafeEqual } from "node:crypto";
+
+const json = (obj, status = 200) =>
+  new Response(JSON.stringify(obj), {
+    status,
+    headers: { "content-type": "application/json", "cache-control": "no-store" },
+  });
+
+const env = (k) => process.env[k] || "";
+const b64u = (s) => Buffer.from(s, "base64url");
+const sha = (s) => createHash("sha256").update(s).digest("hex");
+
+/* ---- Kiểm tra ID token của Google (RS256) bằng khoá công khai của Google ---- */
+let jwks = null, jwksAt = 0;
+async function googleKeys() {
+  if (jwks && Date.now() - jwksAt < 3600e3) return jwks;
+  const r = await fetch("https://www.googleapis.com/oauth2/v3/certs");
+  if (!r.ok) throw new Error("jwks");
+  jwks = (await r.json()).keys;
+  jwksAt = Date.now();
+  return jwks;
+}
+async function verifyGoogle(idToken, clientId) {
+  const [h, p, sg] = String(idToken).split(".");
+  if (!h || !p || !sg) throw new Error("format");
+  const head = JSON.parse(b64u(h).toString());
+  if (head.alg !== "RS256") throw new Error("alg");
+  const jwk = (await googleKeys()).find((k) => k.kid === head.kid);
+  if (!jwk) throw new Error("kid");
+  const ok = verify("RSA-SHA256", Buffer.from(h + "." + p), createPublicKey({ key: jwk, format: "jwk" }), b64u(sg));
+  if (!ok) throw new Error("signature");
+  const c = JSON.parse(b64u(p).toString());
+  if (!["accounts.google.com", "https://accounts.google.com"].includes(c.iss)) throw new Error("iss");
+  if (c.aud !== clientId) throw new Error("aud");
+  if (!c.sub || !(c.exp * 1000 > Date.now())) throw new Error("exp");
+  return c;
+}
+
+/* ---- Phiên đăng nhập do máy chủ cấp (HMAC), hiệu lực 60 ngày ---- */
+const mac = (body) => createHmac("sha256", env("SESSION_SECRET")).update(body).digest("base64url");
+const mkToken = (u) => { const body = Buffer.from(JSON.stringify(u)).toString("base64url"); return "v1." + body + "." + mac(body); };
+function readToken(t) {
+  const [v, body, sig] = String(t).split(".");
+  if (v !== "v1" || !body || !sig || env("SESSION_SECRET").length < 16) return null;
+  const a = Buffer.from(sig), b = Buffer.from(mac(body));
+  if (a.length !== b.length || !timingSafeEqual(a, b)) return null;
+  try { const u = JSON.parse(b64u(body).toString()); return u.sub && u.exp > Date.now() ? u : null; } catch { return null; }
+}
+
+export default async (req) => {
+  const path = new URL(req.url).pathname;
+  const clientId = env("GOOGLE_CLIENT_ID");
+  const ready = !!(clientId && env("SESSION_SECRET").length >= 16);
+
+  if (path === "/api/config") return json({ clientId: ready ? clientId : null });
+
+  if (path === "/api/auth") {
+    if (req.method !== "POST") return json({ error: "method not allowed" }, 405);
+    if (!ready) return json({ error: "not configured" }, 503);
+    let cred;
+    try { cred = (await req.json()).credential; } catch { return json({ error: "bad json" }, 400); }
+    if (typeof cred !== "string" || cred.length > 4096) return json({ error: "bad credential" }, 400);
+    try {
+      const c = await verifyGoogle(cred, clientId);
+      const exp = Date.now() + 60 * 24 * 3600e3;
+      return json({
+        token: mkToken({ sub: c.sub, exp }),
+        uid: sha("uid:" + c.sub).slice(0, 16),
+        email: c.email || "",
+        name: c.name || "",
+        exp,
+      });
+    } catch { return json({ error: "invalid token" }, 401); }
+  }
+
+  if (path === "/api/sync") {
+    const auth = req.headers.get("authorization") || "";
+    const u = auth.startsWith("Bearer ") ? readToken(auth.slice(7)) : null;
+    if (!u) return json({ error: "unauthorized" }, 401);
+    const id = sha("g:" + u.sub);
+    const store = getStore("musiciq-progress");
+    if (req.method === "GET") {
+      const v = await store.get(id, { type: "json" });
+      return v ? json(v) : json({ error: "not found" }, 404);
+    }
+    if (req.method === "PUT") {
+      const text = await req.text();
+      if (text.length > 300000) return json({ error: "too large" }, 413);
+      let body;
+      try { body = JSON.parse(text); } catch { return json({ error: "bad json" }, 400); }
+      if (!body || typeof body.data !== "object" || body.data === null) return json({ error: "bad body" }, 400);
+      await store.setJSON(id, { data: body.data, ts: Number(body.ts) || Date.now() });
+      return json({ ok: true });
+    }
+    return json({ error: "method not allowed" }, 405);
+  }
+  return json({ error: "not found" }, 404);
+};
+
+export const config = { path: ["/api/config", "/api/auth", "/api/sync"] };
